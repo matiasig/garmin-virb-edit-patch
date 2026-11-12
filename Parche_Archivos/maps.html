@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+<title>GARMIN VIRB Map</title>
+<style type="text/css">
+html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #1e2229;
+    font-family: "Segoe UI", Arial, sans-serif;
+    user-select: none;
+    -ms-user-select: none;
+}
+#mapCanvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+.map-controls-left {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    z-index: 10;
+    display: inline-block;
+    background: rgba(255, 255, 255, 0.94);
+    border-radius: 3px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.35);
+    overflow: hidden;
+}
+.map-btn {
+    border: none;
+    background: transparent;
+    color: #333;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 6px 12px;
+    cursor: pointer;
+    outline: none;
+    border-right: 1px solid #ddd;
+}
+.map-btn:last-child {
+    border-right: none;
+}
+.map-btn:hover {
+    background: #f0f0f0;
+}
+.map-btn.active {
+    background: #11a9ed;
+    color: #fff;
+}
+.map-controls-right {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    background: rgba(255, 255, 255, 0.94);
+    border-radius: 3px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.35);
+    overflow: hidden;
+}
+.zoom-btn {
+    border: none;
+    background: transparent;
+    color: #333;
+    font-size: 16px;
+    font-weight: bold;
+    width: 32px;
+    height: 32px;
+    line-height: 30px;
+    text-align: center;
+    cursor: pointer;
+    outline: none;
+    border-bottom: 1px solid #ddd;
+}
+.zoom-btn:last-child {
+    border-bottom: none;
+    font-size: 13px;
+}
+.zoom-btn:hover {
+    background: #f0f0f0;
+}
+.status-bar {
+    position: absolute;
+    bottom: 6px;
+    left: 10px;
+    right: 10px;
+    z-index: 10;
+    pointer-events: none;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11px;
+    color: #eee;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.85);
+}
+.status-pill {
+    background: rgba(20, 24, 30, 0.78);
+    padding: 3px 8px;
+    border-radius: 3px;
+}
+</style>
+</head>
+<body>
+<canvas id="mapCanvas"></canvas>
+
+<div class="map-controls-left">
+    <button id="btnMap" class="map-btn active" onclick="setLayer('road')">Mapa</button>
+    <button id="btnSat" class="map-btn" onclick="setLayer('sat')">Satélite</button>
+    <button id="btnOsm" class="map-btn" onclick="setLayer('osm')">OSM</button>
+</div>
+
+<div class="map-controls-right">
+    <button class="zoom-btn" title="Acercar" onclick="changeZoom(1)">+</button>
+    <button class="zoom-btn" title="Alejar" onclick="changeZoom(-1)">&#8722;</button>
+    <button class="zoom-btn" title="Centrar ruta" onclick="ShowTrack()">&#8982;</button>
+</div>
+
+<div class="status-bar">
+    <div id="coordInfo" class="status-pill">Arrastra el punto rojo sobre la ruta para sincronizar el GPS</div>
+</div>
+
+<script type="text/javascript">
+window.onerror = function() { return true; };
+var canvas = document.getElementById("mapCanvas");
+var ctx = canvas.getContext("2d");
+
+var centerLat = 0.0;
+var centerLon = 0.0;
+var zoom = 2;
+var currentLayer = "road";
+
+var mainTracks = [];
+var segmentTrack = [];
+var bgTracks = [];
+var trackVisible = true;
+
+var markerPos = null;
+var markerVisible = false;
+var hasFittedBounds = false;
+
+var tileCache = {};
+var isDraggingMarker = false;
+var isPanningMap = false;
+var dragStartX = 0;
+var dragStartY = 0;
+var panStartCenterX = 0;
+var panStartCenterY = 0;
+
+function clampLat(lat) {
+    if (lat > 85.05112878) return 85.05112878;
+    if (lat < -85.05112878) return -85.05112878;
+    return lat;
+}
+
+function lonToWorldX(lon, z) {
+    var scale = 256 * Math.pow(2, z);
+    return ((lon + 180.0) / 360.0) * scale;
+}
+
+function latToWorldY(lat, z) {
+    lat = clampLat(lat);
+    var sinLat = Math.sin(lat * Math.PI / 180.0);
+    var scale = 256 * Math.pow(2, z);
+    return (0.5 - Math.log((1 + sinLat) / (1 - sinLat)) / (4 * Math.PI)) * scale;
+}
+
+function worldXToLon(wx, z) {
+    var scale = 256 * Math.pow(2, z);
+    return (wx / scale) * 360.0 - 180.0;
+}
+
+function worldYToLat(wy, z) {
+    var scale = 256 * Math.pow(2, z);
+    var n = Math.PI - (2.0 * Math.PI * wy) / scale;
+    return (180.0 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+}
+
+function latLonToPixel(lat, lon) {
+    var cx = lonToWorldX(centerLon, zoom);
+    var cy = latToWorldY(centerLat, zoom);
+    var wx = lonToWorldX(lon, zoom);
+    var wy = latToWorldY(lat, zoom);
+    return [
+        (canvas.width * 0.5) + (wx - cx),
+        (canvas.height * 0.5) + (wy - cy)
+    ];
+}
+
+function pixelToLatLon(px, py) {
+    var cx = lonToWorldX(centerLon, zoom);
+    var cy = latToWorldY(centerLat, zoom);
+    var wx = cx + (px - canvas.width * 0.5);
+    var wy = cy + (py - canvas.height * 0.5);
+    return [worldYToLat(wy, zoom), worldXToLon(wx, zoom)];
+}
+
+function getTileUrl(layer, z, x, y, fallbackIndex) {
+    var maxTile = Math.pow(2, z);
+    var tx = ((x % maxTile) + maxTile) % maxTile;
+    var sub = (tx + y) & 3;
+    if (layer === "sat") {
+        if (!fallbackIndex) {
+            return "https://mt" + sub + ".google.com/vt/lyrs=y&x=" + tx + "&y=" + y + "&z=" + z;
+        }
+        return "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/" + z + "/" + y + "/" + tx;
+    } else if (layer === "osm") {
+        var osmSub = ["a", "b", "c"][(tx + y) % 3];
+        return "https://" + osmSub + ".tile.openstreetmap.org/" + z + "/" + tx + "/" + y + ".png";
+    } else {
+        if (!fallbackIndex) {
+            return "https://mt" + sub + ".google.com/vt/lyrs=m&x=" + tx + "&y=" + y + "&z=" + z;
+        }
+        var osmSub2 = ["a", "b", "c"][(tx + y) % 3];
+        return "https://" + osmSub2 + ".tile.openstreetmap.org/" + z + "/" + tx + "/" + y + ".png";
+    }
+}
+
+function getTile(layer, z, x, y) {
+    var maxTile = Math.pow(2, z);
+    if (y < 0 || y >= maxTile) return null;
+    var tx = ((x % maxTile) + maxTile) % maxTile;
+    var key = layer + "_" + z + "_" + tx + "_" + y;
+    var entry = tileCache[key];
+    if (entry) return entry;
+
+    entry = { img: new Image(), loaded: false, failed: false, fallbackTried: false };
+    tileCache[key] = entry;
+
+    entry.img.onload = function() {
+        entry.loaded = true;
+        draw();
+    };
+    entry.img.onerror = function() {
+        if (!entry.fallbackTried && (layer === "road" || layer === "sat")) {
+            entry.fallbackTried = true;
+            entry.img.src = getTileUrl(layer, z, tx, y, 1);
+        } else {
+            entry.failed = true;
+        }
+    };
+    entry.img.src = getTileUrl(layer, z, tx, y, 0);
+    return entry;
+}
+
+function drawGridFallback() {
+    ctx.fillStyle = currentLayer === "sat" ? "#161b22" : "#e8ecef";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = currentLayer === "sat" ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.07)";
+    ctx.lineWidth = 1;
+    var step = 64;
+    var cx = lonToWorldX(centerLon, zoom);
+    var cy = latToWorldY(centerLat, zoom);
+    var offsetX = -((cx - canvas.width * 0.5) % step);
+    var offsetY = -((cy - canvas.height * 0.5) % step);
+    ctx.beginPath();
+    for (var x = offsetX; x < canvas.width; x += step) {
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvas.height);
+    }
+    for (var y = offsetY; y < canvas.height; y += step) {
+        ctx.moveTo(0, y);
+        ctx.lineTo(canvas.width, y);
+    }
+    ctx.stroke();
+}
+
+function drawTiles() {
+    drawGridFallback();
+    var z = Math.round(zoom);
+    var cx = lonToWorldX(centerLon, z);
+    var cy = latToWorldY(centerLat, z);
+    var startX = Math.floor((cx - canvas.width * 0.5) / 256);
+    var endX = Math.floor((cx + canvas.width * 0.5) / 256);
+    var startY = Math.floor((cy - canvas.height * 0.5) / 256);
+    var endY = Math.floor((cy + canvas.height * 0.5) / 256);
+
+    for (var tx = startX; tx <= endX; tx++) {
+        for (var ty = startY; ty <= endY; ty++) {
+            var px = Math.round((canvas.width * 0.5) + (tx * 256 - cx));
+            var py = Math.round((canvas.height * 0.5) + (ty * 256 - cy));
+            var t = getTile(currentLayer, z, tx, ty);
+            if (t && t.loaded) {
+                try { ctx.drawImage(t.img, px, py, 256, 256); } catch (e) {}
+            } else if (z > 1) {
+                var pz = z - 1;
+                var ptx = Math.floor(tx / 2);
+                var pty = Math.floor(ty / 2);
+                var maxP = Math.pow(2, pz);
+                var normPtx = ((ptx % maxP) + maxP) % maxP;
+                var pKey = currentLayer + "_" + pz + "_" + normPtx + "_" + pty;
+                var pt = tileCache[pKey];
+                if (pt && pt.loaded) {
+                    var sx = ((tx % 2 + 2) % 2) * 128;
+                    var sy = ((ty % 2 + 2) % 2) * 128;
+                    try { ctx.drawImage(pt.img, sx, sy, 128, 128, px, py, 256, 256); } catch (e) {}
+                }
+            }
+        }
+    }
+}
+
+function drawPolyline(pts, strokeColor, lineWidth, haloColor, haloWidth) {
+    if (!pts || pts.length < 2) return;
+    if (haloColor && haloWidth) {
+        ctx.beginPath();
+        for (var i = 0; i < pts.length; i++) {
+            var p = latLonToPixel(pts[i][0], pts[i][1]);
+            if (i === 0) ctx.moveTo(p[0], p[1]);
+            else ctx.lineTo(p[0], p[1]);
+        }
+        ctx.strokeStyle = haloColor;
+        ctx.lineWidth = haloWidth;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.stroke();
+    }
+    ctx.beginPath();
+    for (var j = 0; j < pts.length; j++) {
+        var p2 = latLonToPixel(pts[j][0], pts[j][1]);
+        if (j === 0) ctx.moveTo(p2[0], p2[1]);
+        else ctx.lineTo(p2[0], p2[1]);
+    }
+    ctx.strokeStyle = strokeColor;
+    ctx.lineWidth = lineWidth;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.stroke();
+}
+
+function drawStartEndDots(pts) {
+    if (!pts || pts.length < 2) return;
+    var pStart = latLonToPixel(pts[0][0], pts[0][1]);
+    var pEnd = latLonToPixel(pts[pts.length - 1][0], pts[pts.length - 1][1]);
+
+    // End dot (dark/white)
+    ctx.beginPath();
+    ctx.arc(pEnd[0], pEnd[1], 5, 0, Math.PI * 2);
+    ctx.fillStyle = "#222";
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#fff";
+    ctx.stroke();
+
+    // Start dot (green)
+    ctx.beginPath();
+    ctx.arc(pStart[0], pStart[1], 5, 0, Math.PI * 2);
+    ctx.fillStyle = "#2ecc71";
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#fff";
+    ctx.stroke();
+}
+
+function draw() {
+    if (canvas.width !== document.body.clientWidth || canvas.height !== document.body.clientHeight) {
+        canvas.width = document.body.clientWidth || 400;
+        canvas.height = document.body.clientHeight || 300;
+    }
+
+    drawTiles();
+
+    // 1. Background tracks
+    for (var b = 0; b < bgTracks.length; b++) {
+        drawPolyline(bgTracks[b], "rgba(130, 140, 150, 0.75)", 3, "rgba(255,255,255,0.5)", 5);
+    }
+
+    // 2. Main GPS tracks
+    if (trackVisible) {
+        for (var m = 0; m < mainTracks.length; m++) {
+            drawPolyline(mainTracks[m], "#ff3b30", 3.5, "rgba(255, 255, 255, 0.85)", 6.5);
+            drawStartEndDots(mainTracks[m]);
+        }
+    }
+
+    // 3. Highlighted Clip Segment
+    if (segmentTrack && segmentTrack.length >= 2) {
+        drawPolyline(segmentTrack, "#11a9ed", 4.5, "rgba(255, 255, 255, 0.92)", 7.5);
+    }
+
+    // 4. Current Position Red Sync Marker (Draggable)
+    if (markerVisible && markerPos) {
+        var mp = latLonToPixel(markerPos[0], markerPos[1]);
+
+        // Outer halo pulse
+        ctx.beginPath();
+        ctx.arc(mp[0], mp[1], 13, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(255, 45, 45, 0.28)";
+        ctx.fill();
+
+        // Main draggable red marker with white border
+        ctx.beginPath();
+        ctx.arc(mp[0], mp[1], 7.5, 0, Math.PI * 2);
+        ctx.fillStyle = "#ff1e1e";
+        ctx.fill();
+        ctx.lineWidth = 2.5;
+        ctx.strokeStyle = "#ffffff";
+        ctx.stroke();
+
+        // Inner white center dot
+        ctx.beginPath();
+        ctx.arc(mp[0], mp[1], 2.2, 0, Math.PI * 2);
+        ctx.fillStyle = "#ffffff";
+        ctx.fill();
+    }
+}
+
+function parsePoints(latsJson, lonsJson) {
+    try {
+        var lats = typeof latsJson === "string" ? JSON.parse(latsJson) : latsJson;
+        var lons = typeof lonsJson === "string" ? JSON.parse(lonsJson) : lonsJson;
+        if (!lats || !lons) return [];
+        var len = Math.min(lats.length, lons.length);
+        var pts = [];
+        for (var i = 0; i < len; i++) {
+            var a = parseFloat(lats[i]);
+            var o = parseFloat(lons[i]);
+            if (!isNaN(a) && !isNaN(o)) {
+                pts.push([a, o]);
+            }
+        }
+        return pts;
+    } catch (e) {
+        return [];
+    }
+}
+
+function getAllPoints() {
+    var all = [];
+    for (var i = 0; i < mainTracks.length; i++) {
+        all = all.concat(mainTracks[i]);
+    }
+    if (all.length === 0 && segmentTrack.length > 0) {
+        all = all.concat(segmentTrack);
+    }
+    if (all.length === 0) {
+        for (var j = 0; j < bgTracks.length; j++) {
+            all = all.concat(bgTracks[j]);
+        }
+    }
+    return all;
+}
+
+function fitBounds() {
+    var pts = getAllPoints();
+    if (pts.length === 0) {
+        if (markerPos) {
+            centerLat = markerPos[0];
+            centerLon = markerPos[1];
+            zoom = 16;
+            draw();
+        }
+        return;
+    }
+    var minLat = pts[0][0], maxLat = pts[0][0];
+    var minLon = pts[0][1], maxLon = pts[0][1];
+    for (var i = 1; i < pts.length; i++) {
+        var la = pts[i][0], lo = pts[i][1];
+        if (la < minLat) minLat = la;
+        if (la > maxLat) maxLat = la;
+        if (lo < minLon) minLon = lo;
+        if (lo > maxLon) maxLon = lo;
+    }
+    centerLat = (minLat + maxLat) * 0.5;
+    centerLon = (minLon + maxLon) * 0.5;
+
+    var w = Math.max(canvas.width || 400, 120) - 70;
+    var h = Math.max(canvas.height || 300, 120) - 70;
+
+    var bestZ = 18;
+    for (var z = 18; z >= 2; z--) {
+        var x1 = lonToWorldX(minLon, z);
+        var x2 = lonToWorldX(maxLon, z);
+        var y1 = latToWorldY(maxLat, z);
+        var y2 = latToWorldY(minLat, z);
+        if (Math.abs(x2 - x1) <= w && Math.abs(y2 - y1) <= h) {
+            bestZ = z;
+            break;
+        }
+    }
+    zoom = bestZ;
+    hasFittedBounds = true;
+    draw();
+}
+
+function setLayer(layer) {
+    currentLayer = layer;
+    document.getElementById("btnMap").className = "map-btn" + (layer === "road" ? " active" : "");
+    document.getElementById("btnSat").className = "map-btn" + (layer === "sat" ? " active" : "");
+    document.getElementById("btnOsm").className = "map-btn" + (layer === "osm" ? " active" : "");
+    draw();
+}
+
+function changeZoom(delta, focusX, focusY) {
+    var oldZoom = zoom;
+    var newZoom = Math.max(2, Math.min(19, Math.round(zoom + delta)));
+    if (newZoom === oldZoom) return;
+
+    if (typeof focusX === "number" && typeof focusY === "number") {
+        var focusLatLon = pixelToLatLon(focusX, focusY);
+        zoom = newZoom;
+        var wx = lonToWorldX(focusLatLon[1], zoom);
+        var wy = latToWorldY(focusLatLon[0], zoom);
+        var newCx = wx - (focusX - canvas.width * 0.5);
+        var newCy = wy - (focusY - canvas.height * 0.5);
+        centerLon = worldXToLon(newCx, zoom);
+        centerLat = clampLat(worldYToLat(newCy, zoom));
+    } else {
+        zoom = newZoom;
+    }
+    draw();
+}
+
+// ============================================================================
+// Functions invoked by Virb.View.Playback.MapControl_t via InvokeScript
+// ============================================================================
+function SetMapControlTitles(unused, mapTitle, satTitle) {
+    if (mapTitle) document.getElementById("btnMap").innerText = mapTitle;
+    if (satTitle) document.getElementById("btnSat").innerText = satTitle;
+}
+
+function SetTrack(latsJson, lonsJson) {
+    var pts = parsePoints(latsJson, lonsJson);
+    mainTracks = pts.length > 0 ? [pts] : [];
+    trackVisible = true;
+    if (pts.length > 0 && !hasFittedBounds) {
+        fitBounds();
+    } else {
+        draw();
+    }
+}
+
+function AddTrack(latsJson, lonsJson) {
+    var pts = parsePoints(latsJson, lonsJson);
+    if (pts.length > 0) {
+        mainTracks.push(pts);
+        trackVisible = true;
+        draw();
+    }
+}
+
+function HideTrack() {
+    trackVisible = false;
+    draw();
+}
+
+function ShowTrack() {
+    trackVisible = true;
+    fitBounds();
+}
+
+function ClearTrackSegment() {
+    segmentTrack = [];
+    draw();
+}
+
+function SetTrackSegment(latsJson, lonsJson) {
+    segmentTrack = parsePoints(latsJson, lonsJson);
+    draw();
+}
+
+function ClearBackgroundTracks() {
+    bgTracks = [];
+    draw();
+}
+
+function AddBackgroundTrack(latsJson, lonsJson) {
+    var pts = parsePoints(latsJson, lonsJson);
+    if (pts.length > 0) {
+        bgTracks.push(pts);
+        draw();
+    }
+}
+
+function SetMarkerPosition(latStr, lonStr) {
+    var lat = parseFloat(latStr);
+    var lon = parseFloat(lonStr);
+    if (!isNaN(lat) && !isNaN(lon)) {
+        markerPos = [lat, lon];
+        markerVisible = true;
+        document.getElementById("coordInfo").innerText =
+            "GPS: " + lat.toFixed(5) + ", " + lon.toFixed(5) + "  |  Arrastra el punto rojo sobre la ruta para sincronizar";
+        if (!hasFittedBounds && mainTracks.length === 0) {
+            centerLat = lat;
+            centerLon = lon;
+            zoom = 16;
+            hasFittedBounds = true;
+        }
+        draw();
+    }
+}
+
+function HideMarker() {
+    markerVisible = false;
+    draw();
+}
+
+// ============================================================================
+// Mouse interaction: Marker Sync Dragging & Map Panning
+// ============================================================================
+function distToSegmentSq(px, py, x1, y1, x2, y2) {
+    var dx = x2 - x1;
+    var dy = y2 - y1;
+    if (dx === 0 && dy === 0) {
+        return (px - x1) * (px - x1) + (py - y1) * (py - y1);
+    }
+    var t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy);
+    if (t < 0) t = 0;
+    else if (t > 1) t = 1;
+    var nx = x1 + t * dx;
+    var ny = y1 + t * dy;
+    return (px - nx) * (px - nx) + (py - ny) * (py - ny);
+}
+
+function isNearTrackOrMarker(mx, my) {
+    if (markerVisible && markerPos) {
+        var mp = latLonToPixel(markerPos[0], markerPos[1]);
+        var d2 = (mx - mp[0]) * (mx - mp[0]) + (my - mp[1]) * (my - mp[1]);
+        if (d2 <= 22 * 22) return true;
+    }
+    if (trackVisible) {
+        for (var t = 0; t < mainTracks.length; t++) {
+            var pts = mainTracks[t];
+            for (var i = 0; i < pts.length - 1; i++) {
+                var p1 = latLonToPixel(pts[i][0], pts[i][1]);
+                var p2 = latLonToPixel(pts[i + 1][0], pts[i + 1][1]);
+                if (distToSegmentSq(mx, my, p1[0], p1[1], p2[0], p2[1]) <= 10 * 10) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+function findLocalClosestOnTrack(lat, lon) {
+    var best = null;
+    var bestDist = Infinity;
+    for (var t = 0; t < mainTracks.length; t++) {
+        var pts = mainTracks[t];
+        for (var i = 0; i < pts.length; i++) {
+            var d = (pts[i][0] - lat) * (pts[i][0] - lat) + (pts[i][1] - lon) * (pts[i][1] - lon);
+            if (d < bestDist) {
+                bestDist = d;
+                best = pts[i];
+            }
+        }
+    }
+    return best || [lat, lon];
+}
+
+function updateMarkerFromMouse(mx, my) {
+    var ll = pixelToLatLon(mx, my);
+    var snapped = null;
+    var snappedWithTime = false;
+    try {
+        if (window.external) {
+            var jsonStr = window.external.GetClosestPositionOnTrack(ll[0], ll[1]);
+            if (jsonStr) {
+                var parsed = JSON.parse(jsonStr);
+                if (parsed && parsed.length >= 2) {
+                    snapped = [parseFloat(parsed[0]), parseFloat(parsed[1])];
+                    snappedWithTime = true;
+                }
+            }
+        }
+    } catch (e) {}
+
+    if (!snapped || isNaN(snapped[0]) || isNaN(snapped[1])) {
+        snapped = findLocalClosestOnTrack(ll[0], ll[1]);
+    }
+
+    markerPos = snapped;
+    markerVisible = true;
+    document.getElementById("coordInfo").innerText =
+        "Sincronizando GPS: " + snapped[0].toFixed(5) + ", " + snapped[1].toFixed(5);
+    if (!snappedWithTime) {
+        try {
+            if (window.external) {
+                window.external.MarkerPositionChanged(snapped[0], snapped[1]);
+            }
+        } catch (e) {}
+    }
+    draw();
+}
+
+canvas.onmousedown = function(e) {
+    e = e || window.event;
+    var mx = e.clientX;
+    var my = e.clientY;
+    if (canvas.setCapture) {
+        try { canvas.setCapture(); } catch (err) {}
+    }
+    if (isNearTrackOrMarker(mx, my)) {
+        isDraggingMarker = true;
+        isPanningMap = false;
+        try {
+            if (window.external) {
+                window.external.DragStartHandler();
+            }
+        } catch (err) {}
+        updateMarkerFromMouse(mx, my);
+    } else {
+        isPanningMap = true;
+        isDraggingMarker = false;
+        dragStartX = mx;
+        dragStartY = my;
+        panStartCenterX = lonToWorldX(centerLon, zoom);
+        panStartCenterY = latToWorldY(centerLat, zoom);
+    }
+};
+
+window.onmousemove = function(e) {
+    e = e || window.event;
+    if ((isDraggingMarker || isPanningMap) && typeof e.buttons === "number" && e.buttons === 0) {
+        window.onmouseup();
+        return;
+    }
+    var mx = e.clientX;
+    var my = e.clientY;
+    if (isDraggingMarker) {
+        updateMarkerFromMouse(mx, my);
+    } else if (isPanningMap) {
+        var dx = mx - dragStartX;
+        var dy = my - dragStartY;
+        centerLon = worldXToLon(panStartCenterX - dx, zoom);
+        centerLat = clampLat(worldYToLat(panStartCenterY - dy, zoom));
+        draw();
+    } else {
+        canvas.style.cursor = isNearTrackOrMarker(mx, my) ? "pointer" : "grab";
+    }
+};
+
+window.onmouseup = function() {
+    if (document.releaseCapture) {
+        try { document.releaseCapture(); } catch (err) {}
+    }
+    if (isDraggingMarker) {
+        isDraggingMarker = false;
+        try {
+            if (window.external) {
+                window.external.DragEndHandler();
+            }
+        } catch (err) {}
+    }
+    isPanningMap = false;
+};
+
+if (canvas.addEventListener) {
+    canvas.addEventListener("wheel", function(e) {
+        e.preventDefault();
+        var delta = e.deltaY < 0 ? 1 : -1;
+        changeZoom(delta, e.clientX, e.clientY);
+    }, false);
+    canvas.addEventListener("mousewheel", function(e) {
+        if (e.preventDefault) e.preventDefault();
+        var delta = e.wheelDelta > 0 ? 1 : -1;
+        changeZoom(delta, e.clientX, e.clientY);
+    }, false);
+}
+
+window.onresize = function() {
+    draw();
+};
+
+window.onload = function() {
+    canvas.width = document.body.clientWidth || 400;
+    canvas.height = document.body.clientHeight || 300;
+    draw();
+    try {
+        if (window.external && typeof window.external.MapDidInitialize === "function") {
+            window.external.MapDidInitialize();
+        }
+    } catch (e) {}
+};
+</script>
+</body>
+</html>
